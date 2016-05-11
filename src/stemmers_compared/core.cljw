@@ -1,0 +1,389 @@
+;; gorilla-repl.fileformat = 1
+
+;; **
+;;; #Choosing a stemmer:
+;;; 
+;;; Stemmers use different approachs (rules), to chop off suffixes, that overstem and understem words to different degrees. The performance of english stemmers, in reducing inflected forms of a word to its root form, are compared to choose the one that stems to match the maximum number of dictionary words (hit rate).
+;;; 
+;;; The stem may not even be a real word. The words 'jumping' and 'jumpiness' may both be stemmed to 'jumpi'. It doesn’t matter - as long as the same terms are produced at index time and at search time, search will just work. A high quality stemmer may be used to display finer results.
+;;; 
+;;; Understemming is the failure to reduce words with the same meaning to the same root. For example, while 'jumped' and 'jumps' are reduced to 'jump', 'jumping' may be reduced to 'jumpi'. It reduces relevant documents (containing the search keyword) that are retreived.
+;;; 
+;;; Overstemming is the failure to keep two words with distinct meanings separate. For instance, 'general' and 'generate' may both be stemmed to 'gener'. It reduces precision - irrelevant documents are returned when they shouldn’t be.
+;;; 
+;;; 
+;;; 
+;;; 
+;;; #Choosing stemming vs lemmetization:
+;;; 
+;;; Similarity metrics like Jaccard distance between words decide ipod & ipad to be very close because they differ by just a letter, which is not desired. A lemma is the dictionary form of a set of related words. The lemma of 'paying', 'paid', and 'pays' is 'pay'. Usually,  the lemma resembles words it is related to but sometimes it doesn’t. For example, the lemma of 'is', 'was', 'am', and 'being' is 'be'.
+;;; 
+;;; Lemmatization, like stemming, tries to group related words (inflections), but it goes one step further by trying to group words by their meaning .
+;;; 
+;;; Lemmatization is a more expensive process that needs to understand the context in which words appear in order to make decisions about what they mean (well suited for nouns). In practice, stemming appears to be just as effective as lemmatization, but with a much lower cost. Also, most words in the dataset may not in the dictionary.
+;;; 
+;; **
+
+;; @@
+(ns stemmers-compared.core
+(:require [clojure.java.io :as io]
+ [clojure.data.json :as json]
+ ;[clojure-stemmer.porter.stemmer :refer [stemming]]
+ [clj-fuzzy.stemmers :as fuzzy]
+          ))
+(import org.tartarus.snowball.ext.LovinsStemmer
+  		org.tartarus.snowball.ext.PorterStemmer
+        org.tartarus.snowball.ext.EnglishStemmer
+        org.apache.lucene.analysis.TokenStream
+        java.io.Reader
+        java.io.StringReader
+        org.apache.lucene.analysis.standard.StandardTokenizer
+        org.apache.lucene.analysis.en.KStemFilterFactory
+        org.apache.lucene.analysis.Analyzer
+        org.apache.lucene.analysis.tokenattributes.CharTermAttribute
+        org.apache.lucene.analysis.en.EnglishMinimalStemmer
+        ;org.apache.lucene.analysis.en.EnglishPossesiveFilter ;removes 's
+        (org.apache.lucene.analysis.hunspell 
+          HunspellStemmer HunspellDictionary)
+        java.io.FileInputStream
+        org.apache.lucene.util.Version)
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-class'>org.apache.lucene.util.Version</span>","value":"org.apache.lucene.util.Version"}
+;; <=
+
+;; **
+;;; Lancaster (Paice/Husk) stemmer
+;; **
+
+;; @@
+(fuzzy/lancaster "apples")
+(fuzzy/lancaster "libraries")
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-string'>&quot;libr&quot;</span>","value":"\"libr\""}
+;; <=
+
+;; **
+;;; Lovins stemmer & its Snowball equivalent (faster)
+;; **
+
+;; @@
+(defn snowball-stem [inst variant]
+  (.setCurrent inst variant)
+  (.stem inst)
+  (.getCurrent inst))
+
+;(snowball-stem (LovinsStemmer.) "apples")
+;(snowball-stem (LovinsStemmer.) "libraries")
+(fuzzy/lovins "apples")
+(fuzzy/lovins "libraries")
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-string'>&quot;libr&quot;</span>","value":"\"libr\""}
+;; <=
+
+;; **
+;;; Porter stemmer - faster than its Snowball equivalent
+;; **
+
+;; @@
+;(stemming "apples")
+;(stemming "libraries")
+(fuzzy/porter "apples")
+(fuzzy/porter "libraries")
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-string'>&quot;librari&quot;</span>","value":"\"librari\""}
+;; <=
+
+;; **
+;;; Snowball-based Porter's original algorithm
+;; **
+
+;; @@
+(snowball-stem (PorterStemmer.) "apples")
+(snowball-stem (PorterStemmer.) "libraries")
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-string'>&quot;librari&quot;</span>","value":"\"librari\""}
+;; <=
+
+;; **
+;;; Snowball Porter2 - updated version
+;; **
+
+;; @@
+(snowball-stem (EnglishStemmer.) "apples")
+(snowball-stem (EnglishStemmer.) "libraries")
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-string'>&quot;librari&quot;</span>","value":"\"librari\""}
+;; <=
+
+;; **
+;;; Krovetz's(K) stemmer - light english stemming
+;; **
+
+;; @@
+(def stream TokenStream)
+(defn kstem [variant]
+ (let [rdr (StringReader. variant)
+       tokenizer (StandardTokenizer. (Version/LUCENE_36) rdr)
+       fact (KStemFilterFactory.)
+       stream (.create fact tokenizer)
+       term (.addAttribute stream CharTermAttribute)]
+  (.reset stream)
+  (.incrementToken stream)
+  (.toString term)))
+(kstem "nanos videos")
+(kstem "automatically opens itunes")
+  
+(defn get-stem [stem-fn variant-lst]
+ (doall 
+   (map
+     (fn[variant]
+  	  (if (> (count (clojure.string/split variant #" ")) 1);multi-term phrase
+      (let [phrase-terms (clojure.string/split variant #" ")
+            last-term (last phrase-terms)
+            tmp (drop-last phrase-terms)
+            stem (stem-fn last-term)]
+        (if (not stem)
+          variant
+          (clojure.string/join #" " (concat tmp [stem]))))
+      (let [stem (stem-fn variant)];single-term phrase
+        (if (not stem)
+          variant
+          stem)))) variant-lst)))
+     
+(get-stem kstem ["apples" "libraries"])
+(get-stem kstem ["nanos videos" "automatically opens itunes"]);originally returned ("nano" "automatic") - stems just the first terms of a phrase
+;; @@
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;nanos video&quot;</span>","value":"\"nanos video\""},{"type":"html","content":"<span class='clj-string'>&quot;automatically opens itune&quot;</span>","value":"\"automatically opens itune\""}],"value":"(\"nanos video\" \"automatically opens itune\")"}
+;; <=
+
+;; **
+;;; Lucene's minimal_english stemmer - for removing plurals
+;; **
+
+;; @@
+(defn luke-stem
+ ([inst variant]
+   (let [truncate-index (.stem inst variant)]
+     (subs variant 0 truncate-index)))
+ ([inst variant len]
+   (let [truncate-index (.stem inst (char-array variant) len)]
+     (subs variant 0 truncate-index))))
+
+;minimal english stemming
+(defn en-min-stem [variant-lst]
+  (map #(luke-stem (EnglishMinimalStemmer.) % (count %)) variant-lst))
+(en-min-stem ["apples" "libraries"])
+(en-min-stem ["nanos videos" "automatically opens iTunes"])
+;; @@
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;nanos video&quot;</span>","value":"\"nanos video\""},{"type":"html","content":"<span class='clj-string'>&quot;automatically opens iTune&quot;</span>","value":"\"automatically opens iTune\""}],"value":"(\"nanos video\" \"automatically opens iTune\")"}
+;; <=
+
+;; **
+;;; Algorithmic stemmers are typically 4-5 x faster than Hunspell stemmers as they have to load all words and affixes into memory.
+;;; A dictionary stemmer is only as good as its dictionary while algorithmic stemmers can process new words.
+;;; Hunspell gives you greater flexibility than the algorithmic stemmers in that you can customize its dictionary.
+;; **
+
+;; @@
+(defn hunspell-stem [variant]
+ (let [affixStream (FileInputStream. (io/file "./resources/en_US.aff"));prefix rules removed as disk would be stemmed to k 
+       dictStream (FileInputStream. (io/file "./resources/en_US.dic"))
+       dict 
+       (HunspellDictionary. affixStream dictStream (Version/LUCENE_36) true)
+       stemmer (HunspellStemmer. dict)
+       stems (.stem stemmer variant)]
+   (if (> (.size stems) 0)
+     (.getStemString (.get stems (dec (.size stems)))))))
+(hunspell-stem "automaticaly opens itunes")
+
+(get-stem hunspell-stem ["apples" "libraries"])
+(get-stem hunspell-stem ["nanos videos" "automaticaly opens itunes"]); originally returned (nil nil) - doesn't process multi-term phrases
+(get-stem hunspell-stem ["disks" "remarkable" "restore" "feet" "mice" "power" "organs" "organization"]);
+;; @@
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;k&quot;</span>","value":"\"k\""},{"type":"html","content":"<span class='clj-string'>&quot;mark&quot;</span>","value":"\"mark\""},{"type":"html","content":"<span class='clj-string'>&quot;store&quot;</span>","value":"\"store\""},{"type":"html","content":"<span class='clj-string'>&quot;feet&quot;</span>","value":"\"feet\""},{"type":"html","content":"<span class='clj-string'>&quot;mice&quot;</span>","value":"\"mice\""},{"type":"html","content":"<span class='clj-string'>&quot;pow&quot;</span>","value":"\"pow\""},{"type":"html","content":"<span class='clj-string'>&quot;organ&quot;</span>","value":"\"organ\""},{"type":"html","content":"<span class='clj-string'>&quot;organization&quot;</span>","value":"\"organization\""}],"value":"(\"k\" \"mark\" \"store\" \"feet\" \"mice\" \"pow\" \"organ\" \"organization\")"}
+;; <=
+
+;; @@
+(defn get-dict-map [in-file]
+  (with-open [rdr (io/reader in-file)]
+    (zipmap (line-seq rdr) (repeat true))))
+;(def dict-map (get-dict-map "./resources/nounlist.txt"))
+(def dict-map (get-dict-map "./resources/wordsEn.txt"))
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-var'>#&#x27;stemmers-compared.core/dict-map</span>","value":"#'stemmers-compared.core/dict-map"}
+;; <=
+
+;; @@
+(defn get-hits [phrase-lst]
+  (let [parsed-res (map 
+              (fn[phrase]
+    	  		(if (= (re-find #"\s" phrase) nil);single-term phrase
+             	  phrase
+             	  (subs (re-find #"\s[^\s]*$" phrase) 1))) phrase-lst);multi-term phrase
+        hits (filter #(get dict-map %) parsed-res)
+        misses (filter #(not (get dict-map %)) parsed-res)
+        ret (filter #(not (.equals % "")) hits)
+        ]
+    (println "\nmiss: " misses)
+    [(count ret) ret]))
+
+;hits
+(get-hits ["apple" "appl"])
+(get-hits ["library" "librari" "libraries"]);plurals excluded in nounlist.txt
+(get-hits ["ipod software update" "ipod software updates"])
+(prn "this line is added as otherwise consecutive calls generating the same output returns that output only once")
+(get-hits ["update" "updates"])
+;; @@
+;; ->
+;;; 
+;;; miss:  (appl)
+;;; 
+;;; miss:  (librari)
+;;; 
+;;; miss:  ()
+;;; &quot;this line is added as otherwise consecutive calls generating the same output returns that output only once&quot;
+;;; 
+;;; miss:  ()
+;;; 
+;; <-
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-vector'>[</span>","close":"<span class='clj-vector'>]</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-unkown'>2</span>","value":"2"},{"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;update&quot;</span>","value":"\"update\""},{"type":"html","content":"<span class='clj-string'>&quot;updates&quot;</span>","value":"\"updates\""}],"value":"(\"update\" \"updates\")"}],"value":"[2 (\"update\" \"updates\")]"}
+;; <=
+
+;; **
+;;; Short-listed stemmers
+;;; 
+;;; - Upon all keywords
+;; **
+
+;; @@
+(defn get-keywords [in-file]
+  (with-open [rdr (io/reader in-file)]
+    (let [lns (line-seq rdr)]
+    	;(prn (count lns))
+  		(->> lns 
+        	(take 500)
+         	vec))))
+(def keywords (get-keywords "./resources/vocab.txt" ;downloaded from https://archive.ics.uci.edu/ml/machine-learning-databases/bag-of-words/
+                            ))            
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-var'>#&#x27;stemmers-compared.core/keywords</span>","value":"#'stemmers-compared.core/keywords"}
+;; <=
+
+;; @@
+;K stem
+(def kstem-keywords-res (get-stem kstem keywords))
+(get-hits kstem-keywords-res)
+
+;EnglishMinimal
+(def en-min-stem-res (map #(luke-stem (EnglishMinimalStemmer.) % (count %)) keywords))
+(get-hits en-min-stem-res)
+
+;Hunspell
+(def hunspell-stem-res (filter #(not (= % nil)) (get-stem hunspell-stem keywords)))
+(get-hits hunspell-stem-res)
+;; @@
+;; ->
+;;; 
+;;; miss:  (aarp abb abdullah abrams abu actblue activ aflcio africanamerican afscme ahmad ahme ahnold aint aksen alex alhusainy ali allawi allday allimportant alqaeda alqaida alsadr altsite amdt americanle andrea andy annenberg antiamerican antibush antidean antigay antikerry apr aps arafat archpundit arent arg ari aristide arlen armitage armstrong ashcroft ashcroft atlarge atrio aug axelrod baathist)
+;;; 
+;;; miss:  (aarp abb abdullah abram abu actblue activiti addresse aflcio africanamerican afscme agenci ahmad ahmed ahnold aint aksen ala alex alhusainy ali allawi allday alli allimportant alqaeda alqaida alsadr altsite amdt americanled analysi andor andrea andy angele annenberg antiamerican antibush antidean antigay antikerry apologi appli approache apr ap arafat archpundit arent arg ari aristide arkansa arlen armitage armstrong ashcroft ashcroft asse atlarge atrio atrociti aug authoriti axelrod baathist)
+;;; 
+;;; miss:  (aarp abb abcs abdullah abram abu actblue aflcio africanamerican afscme ahmad ahmed ahnold aint aksen ala alex alhusainy ali allawi allday allimportant alqaeda alqaida alsadr altsite alzheimers amdt americanled andor andrea andy angele annenberg antiamerican antibush antidean antigay antikerry apr aps arafat archpundit arent arg ari aristide arlen armitage armstrong armys arr arr arr arr arr arr ashame ashcroft ashcrofts atlarge atrios aug axelrod baathist)
+;;; 
+;; <-
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-vector'>[</span>","close":"<span class='clj-vector'>]</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-unkown'>435</span>","value":"435"},{"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;abandon&quot;</span>","value":"\"abandon\""},{"type":"html","content":"<span class='clj-string'>&quot;abandon&quot;</span>","value":"\"abandon\""},{"type":"html","content":"<span class='clj-string'>&quot;abandon&quot;</span>","value":"\"abandon\""},{"type":"html","content":"<span class='clj-string'>&quot;abc&quot;</span>","value":"\"abc\""},{"type":"html","content":"<span class='clj-string'>&quot;ability&quot;</span>","value":"\"ability\""},{"type":"html","content":"<span class='clj-string'>&quot;aboard&quot;</span>","value":"\"aboard\""},{"type":"html","content":"<span class='clj-string'>&quot;abortion&quot;</span>","value":"\"abortion\""},{"type":"html","content":"<span class='clj-string'>&quot;abortion&quot;</span>","value":"\"abortion\""},{"type":"html","content":"<span class='clj-string'>&quot;abraham&quot;</span>","value":"\"abraham\""},{"type":"html","content":"<span class='clj-string'>&quot;abroad&quot;</span>","value":"\"abroad\""},{"type":"html","content":"<span class='clj-string'>&quot;absence&quot;</span>","value":"\"absence\""},{"type":"html","content":"<span class='clj-string'>&quot;absent&quot;</span>","value":"\"absent\""},{"type":"html","content":"<span class='clj-string'>&quot;absentee&quot;</span>","value":"\"absentee\""},{"type":"html","content":"<span class='clj-string'>&quot;absolute&quot;</span>","value":"\"absolute\""},{"type":"html","content":"<span class='clj-string'>&quot;absolute&quot;</span>","value":"\"absolute\""},{"type":"html","content":"<span class='clj-string'>&quot;abstain&quot;</span>","value":"\"abstain\""},{"type":"html","content":"<span class='clj-string'>&quot;absurd&quot;</span>","value":"\"absurd\""},{"type":"html","content":"<span class='clj-string'>&quot;abuse&quot;</span>","value":"\"abuse\""},{"type":"html","content":"<span class='clj-string'>&quot;abuse&quot;</span>","value":"\"abuse\""},{"type":"html","content":"<span class='clj-string'>&quot;academy&quot;</span>","value":"\"academy\""},{"type":"html","content":"<span class='clj-string'>&quot;accent&quot;</span>","value":"\"accent\""},{"type":"html","content":"<span class='clj-string'>&quot;accept&quot;</span>","value":"\"accept\""},{"type":"html","content":"<span class='clj-string'>&quot;accept&quot;</span>","value":"\"accept\""},{"type":"html","content":"<span class='clj-string'>&quot;acceptance&quot;</span>","value":"\"acceptance\""},{"type":"html","content":"<span class='clj-string'>&quot;accept&quot;</span>","value":"\"accept\""},{"type":"html","content":"<span class='clj-string'>&quot;accept&quot;</span>","value":"\"accept\""},{"type":"html","content":"<span class='clj-string'>&quot;access&quot;</span>","value":"\"access\""},{"type":"html","content":"<span class='clj-string'>&quot;accident&quot;</span>","value":"\"accident\""},{"type":"html","content":"<span class='clj-string'>&quot;accidental&quot;</span>","value":"\"accidental\""},{"type":"html","content":"<span class='clj-string'>&quot;accident&quot;</span>","value":"\"accident\""},{"type":"html","content":"<span class='clj-string'>&quot;accomplish&quot;</span>","value":"\"accomplish\""},{"type":"html","content":"<span class='clj-string'>&quot;accomplish&quot;</span>","value":"\"accomplish\""},{"type":"html","content":"<span class='clj-string'>&quot;accomplish&quot;</span>","value":"\"accomplish\""},{"type":"html","content":"<span class='clj-string'>&quot;account&quot;</span>","value":"\"account\""},{"type":"html","content":"<span class='clj-string'>&quot;accountability&quot;</span>","value":"\"accountability\""},{"type":"html","content":"<span class='clj-string'>&quot;account&quot;</span>","value":"\"account\""},{"type":"html","content":"<span class='clj-string'>&quot;account&quot;</span>","value":"\"account\""},{"type":"html","content":"<span class='clj-string'>&quot;account&quot;</span>","value":"\"account\""},{"type":"html","content":"<span class='clj-string'>&quot;accuracy&quot;</span>","value":"\"accuracy\""},{"type":"html","content":"<span class='clj-string'>&quot;accurate&quot;</span>","value":"\"accurate\""},{"type":"html","content":"<span class='clj-string'>&quot;accurate&quot;</span>","value":"\"accurate\""},{"type":"html","content":"<span class='clj-string'>&quot;accusation&quot;</span>","value":"\"accusation\""},{"type":"html","content":"<span class='clj-string'>&quot;accuse&quot;</span>","value":"\"accuse\""},{"type":"html","content":"<span class='clj-string'>&quot;accuse&quot;</span>","value":"\"accuse\""},{"type":"html","content":"<span class='clj-string'>&quot;achieve&quot;</span>","value":"\"achieve\""},{"type":"html","content":"<span class='clj-string'>&quot;achieve&quot;</span>","value":"\"achieve\""},{"type":"html","content":"<span class='clj-string'>&quot;achieve&quot;</span>","value":"\"achieve\""},{"type":"html","content":"<span class='clj-string'>&quot;acknowledge&quot;</span>","value":"\"acknowledge\""},{"type":"html","content":"<span class='clj-string'>&quot;acknowledge&quot;</span>","value":"\"acknowledge\""},{"type":"html","content":"<span class='clj-string'>&quot;aclu&quot;</span>","value":"\"aclu\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;action&quot;</span>","value":"\"action\""},{"type":"html","content":"<span class='clj-string'>&quot;action&quot;</span>","value":"\"action\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;activism&quot;</span>","value":"\"activism\""},{"type":"html","content":"<span class='clj-string'>&quot;activist&quot;</span>","value":"\"activist\""},{"type":"html","content":"<span class='clj-string'>&quot;activist&quot;</span>","value":"\"activist\""},{"type":"html","content":"<span class='clj-string'>&quot;activity&quot;</span>","value":"\"activity\""},{"type":"html","content":"<span class='clj-string'>&quot;activity&quot;</span>","value":"\"activity\""},{"type":"html","content":"<span class='clj-string'>&quot;actor&quot;</span>","value":"\"actor\""},{"type":"html","content":"<span class='clj-string'>&quot;act&quot;</span>","value":"\"act\""},{"type":"html","content":"<span class='clj-string'>&quot;actual&quot;</span>","value":"\"actual\""},{"type":"html","content":"<span class='clj-string'>&quot;adam&quot;</span>","value":"\"adam\""},{"type":"html","content":"<span class='clj-string'>&quot;adam&quot;</span>","value":"\"adam\""},{"type":"html","content":"<span class='clj-string'>&quot;add&quot;</span>","value":"\"add\""},{"type":"html","content":"<span class='clj-string'>&quot;add&quot;</span>","value":"\"add\""},{"type":"html","content":"<span class='clj-string'>&quot;add&quot;</span>","value":"\"add\""},{"type":"html","content":"<span class='clj-string'>&quot;addition&quot;</span>","value":"\"addition\""},{"type":"html","content":"<span class='clj-string'>&quot;additional&quot;</span>","value":"\"additional\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;add&quot;</span>","value":"\"add\""},{"type":"html","content":"<span class='clj-string'>&quot;adjust&quot;</span>","value":"\"adjust\""},{"type":"html","content":"<span class='clj-string'>&quot;adjust&quot;</span>","value":"\"adjust\""},{"type":"html","content":"<span class='clj-string'>&quot;adjust&quot;</span>","value":"\"adjust\""},{"type":"html","content":"<span class='clj-string'>&quot;admin&quot;</span>","value":"\"admin\""},{"type":"html","content":"<span class='clj-string'>&quot;administrate&quot;</span>","value":"\"administrate\""},{"type":"html","content":"<span class='clj-string'>&quot;administrate&quot;</span>","value":"\"administrate\""},{"type":"html","content":"<span class='clj-string'>&quot;administrate&quot;</span>","value":"\"administrate\""},{"type":"html","content":"<span class='clj-string'>&quot;administrator&quot;</span>","value":"\"administrator\""},{"type":"html","content":"<span class='clj-string'>&quot;admire&quot;</span>","value":"\"admire\""},{"type":"html","content":"<span class='clj-string'>&quot;admission&quot;</span>","value":"\"admission\""},{"type":"html","content":"<span class='clj-string'>&quot;admit&quot;</span>","value":"\"admit\""},{"type":"html","content":"<span class='clj-string'>&quot;admit&quot;</span>","value":"\"admit\""},{"type":"html","content":"<span class='clj-string'>&quot;admitted&quot;</span>","value":"\"admitted\""},{"type":"html","content":"<span class='clj-string'>&quot;admitting&quot;</span>","value":"\"admitting\""},{"type":"html","content":"<span class='clj-string'>&quot;ado&quot;</span>","value":"\"ado\""},{"type":"html","content":"<span class='clj-string'>&quot;adopt&quot;</span>","value":"\"adopt\""},{"type":"html","content":"<span class='clj-string'>&quot;adopt&quot;</span>","value":"\"adopt\""},{"type":"html","content":"<span class='clj-string'>&quot;adopt&quot;</span>","value":"\"adopt\""},{"type":"html","content":"<span class='clj-string'>&quot;ad&quot;</span>","value":"\"ad\""},{"type":"html","content":"<span class='clj-string'>&quot;adult&quot;</span>","value":"\"adult\""},{"type":"html","content":"<span class='clj-string'>&quot;adult&quot;</span>","value":"\"adult\""},{"type":"html","content":"<span class='clj-string'>&quot;advance&quot;</span>","value":"\"advance\""},{"type":"html","content":"<span class='clj-string'>&quot;advance&quot;</span>","value":"\"advance\""},{"type":"html","content":"<span class='clj-string'>&quot;advantage&quot;</span>","value":"\"advantage\""},{"type":"html","content":"<span class='clj-string'>&quot;advantage&quot;</span>","value":"\"advantage\""},{"type":"html","content":"<span class='clj-string'>&quot;adventure&quot;</span>","value":"\"adventure\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advertise&quot;</span>","value":"\"advertise\""},{"type":"html","content":"<span class='clj-string'>&quot;advice&quot;</span>","value":"\"advice\""},{"type":"html","content":"<span class='clj-string'>&quot;advise&quot;</span>","value":"\"advise\""},{"type":"html","content":"<span class='clj-string'>&quot;advise&quot;</span>","value":"\"advise\""},{"type":"html","content":"<span class='clj-string'>&quot;advise&quot;</span>","value":"\"advise\""},{"type":"html","content":"<span class='clj-string'>&quot;advisor&quot;</span>","value":"\"advisor\""},{"type":"html","content":"<span class='clj-string'>&quot;advisory&quot;</span>","value":"\"advisory\""},{"type":"html","content":"<span class='clj-string'>&quot;advocacy&quot;</span>","value":"\"advocacy\""},{"type":"html","content":"<span class='clj-string'>&quot;advocate&quot;</span>","value":"\"advocate\""},{"type":"html","content":"<span class='clj-string'>&quot;advocate&quot;</span>","value":"\"advocate\""},{"type":"html","content":"<span class='clj-string'>&quot;affair&quot;</span>","value":"\"affair\""},{"type":"html","content":"<span class='clj-string'>&quot;affair&quot;</span>","value":"\"affair\""},{"type":"html","content":"<span class='clj-string'>&quot;affect&quot;</span>","value":"\"affect\""},{"type":"html","content":"<span class='clj-string'>&quot;affect&quot;</span>","value":"\"affect\""},{"type":"html","content":"<span class='clj-string'>&quot;affiliate&quot;</span>","value":"\"affiliate\""},{"type":"html","content":"<span class='clj-string'>&quot;affiliate&quot;</span>","value":"\"affiliate\""},{"type":"html","content":"<span class='clj-string'>&quot;affiliate&quot;</span>","value":"\"affiliate\""},{"type":"html","content":"<span class='clj-string'>&quot;affiliate&quot;</span>","value":"\"affiliate\""},{"type":"html","content":"<span class='clj-string'>&quot;afford&quot;</span>","value":"\"afford\""},{"type":"html","content":"<span class='clj-string'>&quot;afghan&quot;</span>","value":"\"afghan\""},{"type":"html","content":"<span class='clj-string'>&quot;afghanistan&quot;</span>","value":"\"afghanistan\""},{"type":"html","content":"<span class='clj-string'>&quot;afraid&quot;</span>","value":"\"afraid\""},{"type":"html","content":"<span class='clj-string'>&quot;africa&quot;</span>","value":"\"africa\""},{"type":"html","content":"<span class='clj-string'>&quot;african&quot;</span>","value":"\"african\""},{"type":"html","content":"<span class='clj-string'>&quot;aft&quot;</span>","value":"\"aft\""},{"type":"html","content":"<span class='clj-string'>&quot;aftermath&quot;</span>","value":"\"aftermath\""},{"type":"html","content":"<span class='clj-string'>&quot;afternoon&quot;</span>","value":"\"afternoon\""},{"type":"html","content":"<span class='clj-string'>&quot;afterward&quot;</span>","value":"\"afterward\""},{"type":"html","content":"<span class='clj-string'>&quot;age&quot;</span>","value":"\"age\""},{"type":"html","content":"<span class='clj-string'>&quot;age&quot;</span>","value":"\"age\""},{"type":"html","content":"<span class='clj-string'>&quot;agency&quot;</span>","value":"\"agency\""},{"type":"html","content":"<span class='clj-string'>&quot;agency&quot;</span>","value":"\"agency\""},{"type":"html","content":"<span class='clj-string'>&quot;agenda&quot;</span>","value":"\"agenda\""},{"type":"html","content":"<span class='clj-string'>&quot;agent&quot;</span>","value":"\"agent\""},{"type":"html","content":"<span class='clj-string'>&quot;agent&quot;</span>","value":"\"agent\""},{"type":"html","content":"<span class='clj-string'>&quot;age&quot;</span>","value":"\"age\""},{"type":"html","content":"<span class='clj-string'>&quot;aggressive&quot;</span>","value":"\"aggressive\""},{"type":"html","content":"<span class='clj-string'>&quot;aggressively&quot;</span>","value":"\"aggressively\""},{"type":"html","content":"<span class='clj-string'>&quot;agree&quot;</span>","value":"\"agree\""},{"type":"html","content":"<span class='clj-string'>&quot;agree&quot;</span>","value":"\"agree\""},{"type":"html","content":"<span class='clj-string'>&quot;agree&quot;</span>","value":"\"agree\""},{"type":"html","content":"<span class='clj-string'>&quot;agree&quot;</span>","value":"\"agree\""},{"type":"html","content":"<span class='clj-string'>&quot;agree&quot;</span>","value":"\"agree\""},{"type":"html","content":"<span class='clj-string'>&quot;agriculture&quot;</span>","value":"\"agriculture\""},{"type":"html","content":"<span class='clj-string'>&quot;ahead&quot;</span>","value":"\"ahead\""},{"type":"html","content":"<span class='clj-string'>&quot;aid&quot;</span>","value":"\"aid\""},{"type":"html","content":"<span class='clj-string'>&quot;aide&quot;</span>","value":"\"aide\""},{"type":"html","content":"<span class='clj-string'>&quot;aid&quot;</span>","value":"\"aid\""},{"type":"html","content":"<span class='clj-string'>&quot;aide&quot;</span>","value":"\"aide\""},{"type":"html","content":"<span class='clj-string'>&quot;aim&quot;</span>","value":"\"aim\""},{"type":"html","content":"<span class='clj-string'>&quot;aim&quot;</span>","value":"\"aim\""},{"type":"html","content":"<span class='clj-string'>&quot;aim&quot;</span>","value":"\"aim\""},{"type":"html","content":"<span class='clj-string'>&quot;air&quot;</span>","value":"\"air\""},{"type":"html","content":"<span class='clj-string'>&quot;airborne&quot;</span>","value":"\"airborne\""},{"type":"html","content":"<span class='clj-string'>&quot;aircraft&quot;</span>","value":"\"aircraft\""},{"type":"html","content":"<span class='clj-string'>&quot;air&quot;</span>","value":"\"air\""},{"type":"html","content":"<span class='clj-string'>&quot;air&quot;</span>","value":"\"air\""},{"type":"html","content":"<span class='clj-string'>&quot;airplane&quot;</span>","value":"\"airplane\""},{"type":"html","content":"<span class='clj-string'>&quot;airport&quot;</span>","value":"\"airport\""},{"type":"html","content":"<span class='clj-string'>&quot;airwaves&quot;</span>","value":"\"airwaves\""},{"type":"html","content":"<span class='clj-string'>&quot;akin&quot;</span>","value":"\"akin\""},{"type":"html","content":"<span class='clj-string'>&quot;alabama&quot;</span>","value":"\"alabama\""},{"type":"html","content":"<span class='clj-string'>&quot;alan&quot;</span>","value":"\"alan\""},{"type":"html","content":"<span class='clj-string'>&quot;alarm&quot;</span>","value":"\"alarm\""},{"type":"html","content":"<span class='clj-string'>&quot;alaska&quot;</span>","value":"\"alaska\""},{"type":"html","content":"<span class='clj-string'>&quot;albuquerque&quot;</span>","value":"\"albuquerque\""},{"type":"html","content":"<span class='clj-string'>&quot;alert&quot;</span>","value":"\"alert\""},{"type":"html","content":"<span class='clj-string'>&quot;alert&quot;</span>","value":"\"alert\""},{"type":"html","content":"<span class='clj-string'>&quot;alexander&quot;</span>","value":"\"alexander\""},{"type":"html","content":"<span class='clj-string'>&quot;alexander&quot;</span>","value":"\"alexander\""},{"type":"html","content":"<span class='clj-string'>&quot;alice&quot;</span>","value":"\"alice\""},{"type":"html","content":"<span class='clj-string'>&quot;alienate&quot;</span>","value":"\"alienate\""},{"type":"html","content":"<span class='clj-string'>&quot;ale&quot;</span>","value":"\"ale\""},{"type":"html","content":"<span class='clj-string'>&quot;allegation&quot;</span>","value":"\"allegation\""},{"type":"html","content":"<span class='clj-string'>&quot;allegation&quot;</span>","value":"\"allegation\""},{"type":"html","content":"<span class='clj-string'>&quot;allege&quot;</span>","value":"\"allege\""},{"type":"html","content":"<span class='clj-string'>&quot;allege&quot;</span>","value":"\"allege\""},{"type":"html","content":"<span class='clj-string'>&quot;allegiance&quot;</span>","value":"\"allegiance\""},{"type":"html","content":"<span class='clj-string'>&quot;allegory&quot;</span>","value":"\"allegory\""},{"type":"html","content":"<span class='clj-string'>&quot;allen&quot;</span>","value":"\"allen\""},{"type":"html","content":"<span class='clj-string'>&quot;alliance&quot;</span>","value":"\"alliance\""},{"type":"html","content":"<span class='clj-string'>&quot;alliance&quot;</span>","value":"\"alliance\""},{"type":"html","content":"<span class='clj-string'>&quot;al&quot;</span>","value":"\"al\""},{"type":"html","content":"<span class='clj-string'>&quot;al&quot;</span>","value":"\"al\""},{"type":"html","content":"<span class='clj-string'>&quot;allow&quot;</span>","value":"\"allow\""},{"type":"html","content":"<span class='clj-string'>&quot;allow&quot;</span>","value":"\"allow\""},{"type":"html","content":"<span class='clj-string'>&quot;al&quot;</span>","value":"\"al\""},{"type":"html","content":"<span class='clj-string'>&quot;alongside&quot;</span>","value":"\"alongside\""},{"type":"html","content":"<span class='clj-string'>&quot;alternate&quot;</span>","value":"\"alternate\""},{"type":"html","content":"<span class='clj-string'>&quot;alternate&quot;</span>","value":"\"alternate\""},{"type":"html","content":"<span class='clj-string'>&quot;altogether&quot;</span>","value":"\"altogether\""},{"type":"html","content":"<span class='clj-string'>&quot;amaze&quot;</span>","value":"\"amaze\""},{"type":"html","content":"<span class='clj-string'>&quot;amaze&quot;</span>","value":"\"amaze\""},{"type":"html","content":"<span class='clj-string'>&quot;amazon&quot;</span>","value":"\"amazon\""},{"type":"html","content":"<span class='clj-string'>&quot;ambassador&quot;</span>","value":"\"ambassador\""},{"type":"html","content":"<span class='clj-string'>&quot;ambition&quot;</span>","value":"\"ambition\""},{"type":"html","content":"<span class='clj-string'>&quot;ambitious&quot;</span>","value":"\"ambitious\""},{"type":"html","content":"<span class='clj-string'>&quot;ambush&quot;</span>","value":"\"ambush\""},{"type":"html","content":"<span class='clj-string'>&quot;amend&quot;</span>","value":"\"amend\""},{"type":"html","content":"<span class='clj-string'>&quot;amend&quot;</span>","value":"\"amend\""},{"type":"html","content":"<span class='clj-string'>&quot;america&quot;</span>","value":"\"america\""},{"type":"html","content":"<span class='clj-string'>&quot;american&quot;</span>","value":"\"american\""},{"type":"html","content":"<span class='clj-string'>&quot;american&quot;</span>","value":"\"american\""},{"type":"html","content":"<span class='clj-string'>&quot;america&quot;</span>","value":"\"america\""},{"type":"html","content":"<span class='clj-string'>&quot;amid&quot;</span>","value":"\"amid\""},{"type":"html","content":"<span class='clj-string'>&quot;amidst&quot;</span>","value":"\"amidst\""},{"type":"html","content":"<span class='clj-string'>&quot;ammo&quot;</span>","value":"\"ammo\""},{"type":"html","content":"<span class='clj-string'>&quot;ammunition&quot;</span>","value":"\"ammunition\""},{"type":"html","content":"<span class='clj-string'>&quot;amount&quot;</span>","value":"\"amount\""},{"type":"html","content":"<span class='clj-string'>&quot;amount&quot;</span>","value":"\"amount\""},{"type":"html","content":"<span class='clj-string'>&quot;amp&quot;</span>","value":"\"amp\""},{"type":"html","content":"<span class='clj-string'>&quot;amphibian&quot;</span>","value":"\"amphibian\""},{"type":"html","content":"<span class='clj-string'>&quot;ample&quot;</span>","value":"\"ample\""},{"type":"html","content":"<span class='clj-string'>&quot;analogy&quot;</span>","value":"\"analogy\""},{"type":"html","content":"<span class='clj-string'>&quot;analyses&quot;</span>","value":"\"analyses\""},{"type":"html","content":"<span class='clj-string'>&quot;analysis&quot;</span>","value":"\"analysis\""},{"type":"html","content":"<span class='clj-string'>&quot;analyst&quot;</span>","value":"\"analyst\""},{"type":"html","content":"<span class='clj-string'>&quot;analyst&quot;</span>","value":"\"analyst\""},{"type":"html","content":"<span class='clj-string'>&quot;analyze&quot;</span>","value":"\"analyze\""},{"type":"html","content":"<span class='clj-string'>&quot;analyze&quot;</span>","value":"\"analyze\""},{"type":"html","content":"<span class='clj-string'>&quot;anchor&quot;</span>","value":"\"anchor\""},{"type":"html","content":"<span class='clj-string'>&quot;ancient&quot;</span>","value":"\"ancient\""},{"type":"html","content":"<span class='clj-string'>&quot;andrew&quot;</span>","value":"\"andrew\""},{"type":"html","content":"<span class='clj-string'>&quot;anecdotal&quot;</span>","value":"\"anecdotal\""},{"type":"html","content":"<span class='clj-string'>&quot;anemic&quot;</span>","value":"\"anemic\""},{"type":"html","content":"<span class='clj-string'>&quot;anew&quot;</span>","value":"\"anew\""},{"type":"html","content":"<span class='clj-string'>&quot;anger&quot;</span>","value":"\"anger\""},{"type":"html","content":"<span class='clj-string'>&quot;anger&quot;</span>","value":"\"anger\""},{"type":"html","content":"<span class='clj-string'>&quot;angry&quot;</span>","value":"\"angry\""},{"type":"html","content":"<span class='clj-string'>&quot;angst&quot;</span>","value":"\"angst\""},{"type":"html","content":"<span class='clj-string'>&quot;ann&quot;</span>","value":"\"ann\""},{"type":"html","content":"<span class='clj-string'>&quot;anniversary&quot;</span>","value":"\"anniversary\""},{"type":"html","content":"<span class='clj-string'>&quot;announce&quot;</span>","value":"\"announce\""},{"type":"html","content":"<span class='clj-string'>&quot;announce&quot;</span>","value":"\"announce\""},{"type":"html","content":"<span class='clj-string'>&quot;announce&quot;</span>","value":"\"announce\""},{"type":"html","content":"<span class='clj-string'>&quot;announce&quot;</span>","value":"\"announce\""},{"type":"html","content":"<span class='clj-string'>&quot;announce&quot;</span>","value":"\"announce\""},{"type":"html","content":"<span class='clj-string'>&quot;annoy&quot;</span>","value":"\"annoy\""},{"type":"html","content":"<span class='clj-string'>&quot;annual&quot;</span>","value":"\"annual\""},{"type":"html","content":"<span class='clj-string'>&quot;anonymity&quot;</span>","value":"\"anonymity\""},{"type":"html","content":"<span class='clj-string'>&quot;anonymous&quot;</span>","value":"\"anonymous\""},{"type":"html","content":"<span class='clj-string'>&quot;answer&quot;</span>","value":"\"answer\""},{"type":"html","content":"<span class='clj-string'>&quot;answer&quot;</span>","value":"\"answer\""},{"type":"html","content":"<span class='clj-string'>&quot;answer&quot;</span>","value":"\"answer\""},{"type":"html","content":"<span class='clj-string'>&quot;answer&quot;</span>","value":"\"answer\""},{"type":"html","content":"<span class='clj-string'>&quot;anthony&quot;</span>","value":"\"anthony\""},{"type":"html","content":"<span class='clj-string'>&quot;antiabortion&quot;</span>","value":"\"antiabortion\""},{"type":"html","content":"<span class='clj-string'>&quot;anticipate&quot;</span>","value":"\"anticipate\""},{"type":"html","content":"<span class='clj-string'>&quot;antiwar&quot;</span>","value":"\"antiwar\""},{"type":"html","content":"<span class='clj-string'>&quot;anxiety&quot;</span>","value":"\"anxiety\""},{"type":"html","content":"<span class='clj-string'>&quot;anymore&quot;</span>","value":"\"anymore\""},{"type":"html","content":"<span class='clj-string'>&quot;anytime&quot;</span>","value":"\"anytime\""},{"type":"html","content":"<span class='clj-string'>&quot;apology&quot;</span>","value":"\"apology\""},{"type":"html","content":"<span class='clj-string'>&quot;apologist&quot;</span>","value":"\"apologist\""},{"type":"html","content":"<span class='clj-string'>&quot;apologize&quot;</span>","value":"\"apologize\""},{"type":"html","content":"<span class='clj-string'>&quot;apology&quot;</span>","value":"\"apology\""},{"type":"html","content":"<span class='clj-string'>&quot;appall&quot;</span>","value":"\"appall\""},{"type":"html","content":"<span class='clj-string'>&quot;apparatus&quot;</span>","value":"\"apparatus\""},{"type":"html","content":"<span class='clj-string'>&quot;apparent&quot;</span>","value":"\"apparent\""},{"type":"html","content":"<span class='clj-string'>&quot;apparently&quot;</span>","value":"\"apparently\""},{"type":"html","content":"<span class='clj-string'>&quot;appeal&quot;</span>","value":"\"appeal\""},{"type":"html","content":"<span class='clj-string'>&quot;appeal&quot;</span>","value":"\"appeal\""},{"type":"html","content":"<span class='clj-string'>&quot;appeal&quot;</span>","value":"\"appeal\""},{"type":"html","content":"<span class='clj-string'>&quot;appeal&quot;</span>","value":"\"appeal\""},{"type":"html","content":"<span class='clj-string'>&quot;appearance&quot;</span>","value":"\"appearance\""},{"type":"html","content":"<span class='clj-string'>&quot;appearance&quot;</span>","value":"\"appearance\""},{"type":"html","content":"<span class='clj-string'>&quot;appear&quot;</span>","value":"\"appear\""},{"type":"html","content":"<span class='clj-string'>&quot;appear&quot;</span>","value":"\"appear\""},{"type":"html","content":"<span class='clj-string'>&quot;appear&quot;</span>","value":"\"appear\""},{"type":"html","content":"<span class='clj-string'>&quot;applause&quot;</span>","value":"\"applause\""},{"type":"html","content":"<span class='clj-string'>&quot;apple&quot;</span>","value":"\"apple\""},{"type":"html","content":"<span class='clj-string'>&quot;apple&quot;</span>","value":"\"apple\""},{"type":"html","content":"<span class='clj-string'>&quot;apply&quot;</span>","value":"\"apply\""},{"type":"html","content":"<span class='clj-string'>&quot;apply&quot;</span>","value":"\"apply\""},{"type":"html","content":"<span class='clj-string'>&quot;apply&quot;</span>","value":"\"apply\""},{"type":"html","content":"<span class='clj-string'>&quot;apply&quot;</span>","value":"\"apply\""},{"type":"html","content":"<span class='clj-string'>&quot;apply&quot;</span>","value":"\"apply\""},{"type":"html","content":"<span class='clj-string'>&quot;appoint&quot;</span>","value":"\"appoint\""},{"type":"html","content":"<span class='clj-string'>&quot;appoint&quot;</span>","value":"\"appoint\""},{"type":"html","content":"<span class='clj-string'>&quot;appreciate&quot;</span>","value":"\"appreciate\""},{"type":"html","content":"<span class='clj-string'>&quot;appreciate&quot;</span>","value":"\"appreciate\""},{"type":"html","content":"<span class='clj-string'>&quot;approach&quot;</span>","value":"\"approach\""},{"type":"html","content":"<span class='clj-string'>&quot;approach&quot;</span>","value":"\"approach\""},{"type":"html","content":"<span class='clj-string'>&quot;approach&quot;</span>","value":"\"approach\""},{"type":"html","content":"<span class='clj-string'>&quot;approach&quot;</span>","value":"\"approach\""},{"type":"html","content":"<span class='clj-string'>&quot;appropriate&quot;</span>","value":"\"appropriate\""},{"type":"html","content":"<span class='clj-string'>&quot;approval&quot;</span>","value":"\"approval\""},{"type":"html","content":"<span class='clj-string'>&quot;approve&quot;</span>","value":"\"approve\""},{"type":"html","content":"<span class='clj-string'>&quot;approve&quot;</span>","value":"\"approve\""},{"type":"html","content":"<span class='clj-string'>&quot;approximate&quot;</span>","value":"\"approximate\""},{"type":"html","content":"<span class='clj-string'>&quot;april&quot;</span>","value":"\"april\""},{"type":"html","content":"<span class='clj-string'>&quot;apt&quot;</span>","value":"\"apt\""},{"type":"html","content":"<span class='clj-string'>&quot;arab&quot;</span>","value":"\"arab\""},{"type":"html","content":"<span class='clj-string'>&quot;arabia&quot;</span>","value":"\"arabia\""},{"type":"html","content":"<span class='clj-string'>&quot;arabic&quot;</span>","value":"\"arabic\""},{"type":"html","content":"<span class='clj-string'>&quot;arab&quot;</span>","value":"\"arab\""},{"type":"html","content":"<span class='clj-string'>&quot;architect&quot;</span>","value":"\"architect\""},{"type":"html","content":"<span class='clj-string'>&quot;arch&quot;</span>","value":"\"arch\""},{"type":"html","content":"<span class='clj-string'>&quot;arctic&quot;</span>","value":"\"arctic\""},{"type":"html","content":"<span class='clj-string'>&quot;area&quot;</span>","value":"\"area\""},{"type":"html","content":"<span class='clj-string'>&quot;area&quot;</span>","value":"\"area\""},{"type":"html","content":"<span class='clj-string'>&quot;arena&quot;</span>","value":"\"arena\""},{"type":"html","content":"<span class='clj-string'>&quot;argue&quot;</span>","value":"\"argue\""},{"type":"html","content":"<span class='clj-string'>&quot;argue&quot;</span>","value":"\"argue\""},{"type":"html","content":"<span class='clj-string'>&quot;argue&quot;</span>","value":"\"argue\""},{"type":"html","content":"<span class='clj-string'>&quot;argue&quot;</span>","value":"\"argue\""},{"type":"html","content":"<span class='clj-string'>&quot;argument&quot;</span>","value":"\"argument\""},{"type":"html","content":"<span class='clj-string'>&quot;argument&quot;</span>","value":"\"argument\""},{"type":"html","content":"<span class='clj-string'>&quot;arizona&quot;</span>","value":"\"arizona\""},{"type":"html","content":"<span class='clj-string'>&quot;arkansas&quot;</span>","value":"\"arkansas\""},{"type":"html","content":"<span class='clj-string'>&quot;arlington&quot;</span>","value":"\"arlington\""},{"type":"html","content":"<span class='clj-string'>&quot;arm&quot;</span>","value":"\"arm\""},{"type":"html","content":"<span class='clj-string'>&quot;arm&quot;</span>","value":"\"arm\""},{"type":"html","content":"<span class='clj-string'>&quot;armor&quot;</span>","value":"\"armor\""},{"type":"html","content":"<span class='clj-string'>&quot;armor&quot;</span>","value":"\"armor\""},{"type":"html","content":"<span class='clj-string'>&quot;arm&quot;</span>","value":"\"arm\""},{"type":"html","content":"<span class='clj-string'>&quot;army&quot;</span>","value":"\"army\""},{"type":"html","content":"<span class='clj-string'>&quot;arnold&quot;</span>","value":"\"arnold\""},{"type":"html","content":"<span class='clj-string'>&quot;arrogance&quot;</span>","value":"\"arrogance\""},{"type":"html","content":"<span class='clj-string'>&quot;arrogant&quot;</span>","value":"\"arrogant\""},{"type":"html","content":"<span class='clj-string'>&quot;art&quot;</span>","value":"\"art\""},{"type":"html","content":"<span class='clj-string'>&quot;article&quot;</span>","value":"\"article\""},{"type":"html","content":"<span class='clj-string'>&quot;article&quot;</span>","value":"\"article\""},{"type":"html","content":"<span class='clj-string'>&quot;articulate&quot;</span>","value":"\"articulate\""},{"type":"html","content":"<span class='clj-string'>&quot;artillery&quot;</span>","value":"\"artillery\""},{"type":"html","content":"<span class='clj-string'>&quot;asap&quot;</span>","value":"\"asap\""},{"type":"html","content":"<span class='clj-string'>&quot;asia&quot;</span>","value":"\"asia\""},{"type":"html","content":"<span class='clj-string'>&quot;asian&quot;</span>","value":"\"asian\""},{"type":"html","content":"<span class='clj-string'>&quot;ask&quot;</span>","value":"\"ask\""},{"type":"html","content":"<span class='clj-string'>&quot;ask&quot;</span>","value":"\"ask\""},{"type":"html","content":"<span class='clj-string'>&quot;aspect&quot;</span>","value":"\"aspect\""},{"type":"html","content":"<span class='clj-string'>&quot;aspect&quot;</span>","value":"\"aspect\""},{"type":"html","content":"<span class='clj-string'>&quot;aspirate&quot;</span>","value":"\"aspirate\""},{"type":"html","content":"<span class='clj-string'>&quot;ass&quot;</span>","value":"\"ass\""},{"type":"html","content":"<span class='clj-string'>&quot;assassinate&quot;</span>","value":"\"assassinate\""},{"type":"html","content":"<span class='clj-string'>&quot;assault&quot;</span>","value":"\"assault\""},{"type":"html","content":"<span class='clj-string'>&quot;assemble&quot;</span>","value":"\"assemble\""},{"type":"html","content":"<span class='clj-string'>&quot;assembly&quot;</span>","value":"\"assembly\""},{"type":"html","content":"<span class='clj-string'>&quot;assert&quot;</span>","value":"\"assert\""},{"type":"html","content":"<span class='clj-string'>&quot;assertion&quot;</span>","value":"\"assertion\""},{"type":"html","content":"<span class='clj-string'>&quot;assertion&quot;</span>","value":"\"assertion\""},{"type":"html","content":"<span class='clj-string'>&quot;ass&quot;</span>","value":"\"ass\""},{"type":"html","content":"<span class='clj-string'>&quot;assess&quot;</span>","value":"\"assess\""},{"type":"html","content":"<span class='clj-string'>&quot;assess&quot;</span>","value":"\"assess\""},{"type":"html","content":"<span class='clj-string'>&quot;assess&quot;</span>","value":"\"assess\""},{"type":"html","content":"<span class='clj-string'>&quot;asset&quot;</span>","value":"\"asset\""},{"type":"html","content":"<span class='clj-string'>&quot;asset&quot;</span>","value":"\"asset\""},{"type":"html","content":"<span class='clj-string'>&quot;asshole&quot;</span>","value":"\"asshole\""},{"type":"html","content":"<span class='clj-string'>&quot;asshole&quot;</span>","value":"\"asshole\""},{"type":"html","content":"<span class='clj-string'>&quot;assign&quot;</span>","value":"\"assign\""},{"type":"html","content":"<span class='clj-string'>&quot;assign&quot;</span>","value":"\"assign\""},{"type":"html","content":"<span class='clj-string'>&quot;assist&quot;</span>","value":"\"assist\""},{"type":"html","content":"<span class='clj-string'>&quot;assistance&quot;</span>","value":"\"assistance\""},{"type":"html","content":"<span class='clj-string'>&quot;assistant&quot;</span>","value":"\"assistant\""},{"type":"html","content":"<span class='clj-string'>&quot;associate&quot;</span>","value":"\"associate\""},{"type":"html","content":"<span class='clj-string'>&quot;associate&quot;</span>","value":"\"associate\""},{"type":"html","content":"<span class='clj-string'>&quot;associate&quot;</span>","value":"\"associate\""},{"type":"html","content":"<span class='clj-string'>&quot;assume&quot;</span>","value":"\"assume\""},{"type":"html","content":"<span class='clj-string'>&quot;assume&quot;</span>","value":"\"assume\""},{"type":"html","content":"<span class='clj-string'>&quot;assume&quot;</span>","value":"\"assume\""},{"type":"html","content":"<span class='clj-string'>&quot;assume&quot;</span>","value":"\"assume\""},{"type":"html","content":"<span class='clj-string'>&quot;assumption&quot;</span>","value":"\"assumption\""},{"type":"html","content":"<span class='clj-string'>&quot;assumption&quot;</span>","value":"\"assumption\""},{"type":"html","content":"<span class='clj-string'>&quot;assure&quot;</span>","value":"\"assure\""},{"type":"html","content":"<span class='clj-string'>&quot;assure&quot;</span>","value":"\"assure\""},{"type":"html","content":"<span class='clj-string'>&quot;atlanta&quot;</span>","value":"\"atlanta\""},{"type":"html","content":"<span class='clj-string'>&quot;atlantic&quot;</span>","value":"\"atlantic\""},{"type":"html","content":"<span class='clj-string'>&quot;atomic&quot;</span>","value":"\"atomic\""},{"type":"html","content":"<span class='clj-string'>&quot;atrocity&quot;</span>","value":"\"atrocity\""},{"type":"html","content":"<span class='clj-string'>&quot;attach&quot;</span>","value":"\"attach\""},{"type":"html","content":"<span class='clj-string'>&quot;attack&quot;</span>","value":"\"attack\""},{"type":"html","content":"<span class='clj-string'>&quot;attack&quot;</span>","value":"\"attack\""},{"type":"html","content":"<span class='clj-string'>&quot;attack&quot;</span>","value":"\"attack\""},{"type":"html","content":"<span class='clj-string'>&quot;attack&quot;</span>","value":"\"attack\""},{"type":"html","content":"<span class='clj-string'>&quot;attempt&quot;</span>","value":"\"attempt\""},{"type":"html","content":"<span class='clj-string'>&quot;attempt&quot;</span>","value":"\"attempt\""},{"type":"html","content":"<span class='clj-string'>&quot;attempt&quot;</span>","value":"\"attempt\""},{"type":"html","content":"<span class='clj-string'>&quot;attempt&quot;</span>","value":"\"attempt\""},{"type":"html","content":"<span class='clj-string'>&quot;attend&quot;</span>","value":"\"attend\""},{"type":"html","content":"<span class='clj-string'>&quot;attendance&quot;</span>","value":"\"attendance\""},{"type":"html","content":"<span class='clj-string'>&quot;attend&quot;</span>","value":"\"attend\""},{"type":"html","content":"<span class='clj-string'>&quot;attend&quot;</span>","value":"\"attend\""},{"type":"html","content":"<span class='clj-string'>&quot;attention&quot;</span>","value":"\"attention\""},{"type":"html","content":"<span class='clj-string'>&quot;attitude&quot;</span>","value":"\"attitude\""},{"type":"html","content":"<span class='clj-string'>&quot;attitude&quot;</span>","value":"\"attitude\""},{"type":"html","content":"<span class='clj-string'>&quot;attorney&quot;</span>","value":"\"attorney\""},{"type":"html","content":"<span class='clj-string'>&quot;attorney&quot;</span>","value":"\"attorney\""},{"type":"html","content":"<span class='clj-string'>&quot;attract&quot;</span>","value":"\"attract\""},{"type":"html","content":"<span class='clj-string'>&quot;attract&quot;</span>","value":"\"attract\""},{"type":"html","content":"<span class='clj-string'>&quot;attribute&quot;</span>","value":"\"attribute\""},{"type":"html","content":"<span class='clj-string'>&quot;audience&quot;</span>","value":"\"audience\""},{"type":"html","content":"<span class='clj-string'>&quot;audio&quot;</span>","value":"\"audio\""},{"type":"html","content":"<span class='clj-string'>&quot;august&quot;</span>","value":"\"august\""},{"type":"html","content":"<span class='clj-string'>&quot;austin&quot;</span>","value":"\"austin\""},{"type":"html","content":"<span class='clj-string'>&quot;australia&quot;</span>","value":"\"australia\""},{"type":"html","content":"<span class='clj-string'>&quot;australian&quot;</span>","value":"\"australian\""},{"type":"html","content":"<span class='clj-string'>&quot;author&quot;</span>","value":"\"author\""},{"type":"html","content":"<span class='clj-string'>&quot;authority&quot;</span>","value":"\"authority\""},{"type":"html","content":"<span class='clj-string'>&quot;authority&quot;</span>","value":"\"authority\""},{"type":"html","content":"<span class='clj-string'>&quot;authorization&quot;</span>","value":"\"authorization\""},{"type":"html","content":"<span class='clj-string'>&quot;authorize&quot;</span>","value":"\"authorize\""},{"type":"html","content":"<span class='clj-string'>&quot;authorize&quot;</span>","value":"\"authorize\""},{"type":"html","content":"<span class='clj-string'>&quot;author&quot;</span>","value":"\"author\""},{"type":"html","content":"<span class='clj-string'>&quot;automate&quot;</span>","value":"\"automate\""},{"type":"html","content":"<span class='clj-string'>&quot;auxiliary&quot;</span>","value":"\"auxiliary\""},{"type":"html","content":"<span class='clj-string'>&quot;average&quot;</span>","value":"\"average\""},{"type":"html","content":"<span class='clj-string'>&quot;avoid&quot;</span>","value":"\"avoid\""},{"type":"html","content":"<span class='clj-string'>&quot;avoid&quot;</span>","value":"\"avoid\""},{"type":"html","content":"<span class='clj-string'>&quot;avoid&quot;</span>","value":"\"avoid\""},{"type":"html","content":"<span class='clj-string'>&quot;await&quot;</span>","value":"\"await\""},{"type":"html","content":"<span class='clj-string'>&quot;await&quot;</span>","value":"\"await\""},{"type":"html","content":"<span class='clj-string'>&quot;award&quot;</span>","value":"\"award\""},{"type":"html","content":"<span class='clj-string'>&quot;award&quot;</span>","value":"\"award\""},{"type":"html","content":"<span class='clj-string'>&quot;award&quot;</span>","value":"\"award\""},{"type":"html","content":"<span class='clj-string'>&quot;aware&quot;</span>","value":"\"aware\""},{"type":"html","content":"<span class='clj-string'>&quot;aware&quot;</span>","value":"\"aware\""},{"type":"html","content":"<span class='clj-string'>&quot;awesome&quot;</span>","value":"\"awesome\""},{"type":"html","content":"<span class='clj-string'>&quot;awful&quot;</span>","value":"\"awful\""},{"type":"html","content":"<span class='clj-string'>&quot;awol&quot;</span>","value":"\"awol\""},{"type":"html","content":"<span class='clj-string'>&quot;ayatollah&quot;</span>","value":"\"ayatollah\""},{"type":"html","content":"<span class='clj-string'>&quot;baby&quot;</span>","value":"\"baby\""},{"type":"html","content":"<span class='clj-string'>&quot;back&quot;</span>","value":"\"back\""},{"type":"html","content":"<span class='clj-string'>&quot;back&quot;</span>","value":"\"back\""},{"type":"html","content":"<span class='clj-string'>&quot;background&quot;</span>","value":"\"background\""},{"type":"html","content":"<span class='clj-string'>&quot;back&quot;</span>","value":"\"back\""},{"type":"html","content":"<span class='clj-string'>&quot;back&quot;</span>","value":"\"back\""},{"type":"html","content":"<span class='clj-string'>&quot;bad&quot;</span>","value":"\"bad\""}],"value":"(\"abandon\" \"abandon\" \"abandon\" \"abc\" \"ability\" \"aboard\" \"abortion\" \"abortion\" \"abraham\" \"abroad\" \"absence\" \"absent\" \"absentee\" \"absolute\" \"absolute\" \"abstain\" \"absurd\" \"abuse\" \"abuse\" \"academy\" \"accent\" \"accept\" \"accept\" \"acceptance\" \"accept\" \"accept\" \"access\" \"accident\" \"accidental\" \"accident\" \"accomplish\" \"accomplish\" \"accomplish\" \"account\" \"accountability\" \"account\" \"account\" \"account\" \"accuracy\" \"accurate\" \"accurate\" \"accusation\" \"accuse\" \"accuse\" \"achieve\" \"achieve\" \"achieve\" \"acknowledge\" \"acknowledge\" \"aclu\" \"act\" \"act\" \"act\" \"action\" \"action\" \"act\" \"act\" \"activism\" \"activist\" \"activist\" \"activity\" \"activity\" \"actor\" \"act\" \"actual\" \"adam\" \"adam\" \"add\" \"add\" \"add\" \"addition\" \"additional\" \"address\" \"address\" \"address\" \"address\" \"add\" \"adjust\" \"adjust\" \"adjust\" \"admin\" \"administrate\" \"administrate\" \"administrate\" \"administrator\" \"admire\" \"admission\" \"admit\" \"admit\" \"admitted\" \"admitting\" \"ado\" \"adopt\" \"adopt\" \"adopt\" \"ad\" \"adult\" \"adult\" \"advance\" \"advance\" \"advantage\" \"advantage\" \"adventure\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advice\" \"advise\" \"advise\" \"advise\" \"advisor\" \"advisory\" \"advocacy\" \"advocate\" \"advocate\" \"affair\" \"affair\" \"affect\" \"affect\" \"affiliate\" \"affiliate\" \"affiliate\" \"affiliate\" \"afford\" \"afghan\" \"afghanistan\" \"afraid\" \"africa\" \"african\" \"aft\" \"aftermath\" \"afternoon\" \"afterward\" \"age\" \"age\" \"agency\" \"agency\" \"agenda\" \"agent\" \"agent\" \"age\" \"aggressive\" \"aggressively\" \"agree\" \"agree\" \"agree\" \"agree\" \"agree\" \"agriculture\" \"ahead\" \"aid\" \"aide\" \"aid\" \"aide\" \"aim\" \"aim\" \"aim\" \"air\" \"airborne\" \"aircraft\" \"air\" \"air\" \"airplane\" \"airport\" \"airwaves\" \"akin\" \"alabama\" \"alan\" \"alarm\" \"alaska\" \"albuquerque\" \"alert\" \"alert\" \"alexander\" \"alexander\" \"alice\" \"alienate\" \"ale\" \"allegation\" \"allegation\" \"allege\" \"allege\" \"allegiance\" \"allegory\" \"allen\" \"alliance\" \"alliance\" \"al\" \"al\" \"allow\" \"allow\" \"al\" \"alongside\" \"alternate\" \"alternate\" \"altogether\" \"amaze\" \"amaze\" \"amazon\" \"ambassador\" \"ambition\" \"ambitious\" \"ambush\" \"amend\" \"amend\" \"america\" \"american\" \"american\" \"america\" \"amid\" \"amidst\" \"ammo\" \"ammunition\" \"amount\" \"amount\" \"amp\" \"amphibian\" \"ample\" \"analogy\" \"analyses\" \"analysis\" \"analyst\" \"analyst\" \"analyze\" \"analyze\" \"anchor\" \"ancient\" \"andrew\" \"anecdotal\" \"anemic\" \"anew\" \"anger\" \"anger\" \"angry\" \"angst\" \"ann\" \"anniversary\" \"announce\" \"announce\" \"announce\" \"announce\" \"announce\" \"annoy\" \"annual\" \"anonymity\" \"anonymous\" \"answer\" \"answer\" \"answer\" \"answer\" \"anthony\" \"antiabortion\" \"anticipate\" \"antiwar\" \"anxiety\" \"anymore\" \"anytime\" \"apology\" \"apologist\" \"apologize\" \"apology\" \"appall\" \"apparatus\" \"apparent\" \"apparently\" \"appeal\" \"appeal\" \"appeal\" \"appeal\" \"appearance\" \"appearance\" \"appear\" \"appear\" \"appear\" \"applause\" \"apple\" \"apple\" \"apply\" \"apply\" \"apply\" \"apply\" \"apply\" \"appoint\" \"appoint\" \"appreciate\" \"appreciate\" \"approach\" \"approach\" \"approach\" \"approach\" \"appropriate\" \"approval\" \"approve\" \"approve\" \"approximate\" \"april\" \"apt\" \"arab\" \"arabia\" \"arabic\" \"arab\" \"architect\" \"arch\" \"arctic\" \"area\" \"area\" \"arena\" \"argue\" \"argue\" \"argue\" \"argue\" \"argument\" \"argument\" \"arizona\" \"arkansas\" \"arlington\" \"arm\" \"arm\" \"armor\" \"armor\" \"arm\" \"army\" \"arnold\" \"arrogance\" \"arrogant\" \"art\" \"article\" \"article\" \"articulate\" \"artillery\" \"asap\" \"asia\" \"asian\" \"ask\" \"ask\" \"aspect\" \"aspect\" \"aspirate\" \"ass\" \"assassinate\" \"assault\" \"assemble\" \"assembly\" \"assert\" \"assertion\" \"assertion\" \"ass\" \"assess\" \"assess\" \"assess\" \"asset\" \"asset\" \"asshole\" \"asshole\" \"assign\" \"assign\" \"assist\" \"assistance\" \"assistant\" \"associate\" \"associate\" \"associate\" \"assume\" \"assume\" \"assume\" \"assume\" \"assumption\" \"assumption\" \"assure\" \"assure\" \"atlanta\" \"atlantic\" \"atomic\" \"atrocity\" \"attach\" \"attack\" \"attack\" \"attack\" \"attack\" \"attempt\" \"attempt\" \"attempt\" \"attempt\" \"attend\" \"attendance\" \"attend\" \"attend\" \"attention\" \"attitude\" \"attitude\" \"attorney\" \"attorney\" \"attract\" \"attract\" \"attribute\" \"audience\" \"audio\" \"august\" \"austin\" \"australia\" \"australian\" \"author\" \"authority\" \"authority\" \"authorization\" \"authorize\" \"authorize\" \"author\" \"automate\" \"auxiliary\" \"average\" \"avoid\" \"avoid\" \"avoid\" \"await\" \"await\" \"award\" \"award\" \"award\" \"aware\" \"aware\" \"awesome\" \"awful\" \"awol\" \"ayatollah\" \"baby\" \"back\" \"back\" \"background\" \"back\" \"back\" \"bad\")"}],"value":"[435 (\"abandon\" \"abandon\" \"abandon\" \"abc\" \"ability\" \"aboard\" \"abortion\" \"abortion\" \"abraham\" \"abroad\" \"absence\" \"absent\" \"absentee\" \"absolute\" \"absolute\" \"abstain\" \"absurd\" \"abuse\" \"abuse\" \"academy\" \"accent\" \"accept\" \"accept\" \"acceptance\" \"accept\" \"accept\" \"access\" \"accident\" \"accidental\" \"accident\" \"accomplish\" \"accomplish\" \"accomplish\" \"account\" \"accountability\" \"account\" \"account\" \"account\" \"accuracy\" \"accurate\" \"accurate\" \"accusation\" \"accuse\" \"accuse\" \"achieve\" \"achieve\" \"achieve\" \"acknowledge\" \"acknowledge\" \"aclu\" \"act\" \"act\" \"act\" \"action\" \"action\" \"act\" \"act\" \"activism\" \"activist\" \"activist\" \"activity\" \"activity\" \"actor\" \"act\" \"actual\" \"adam\" \"adam\" \"add\" \"add\" \"add\" \"addition\" \"additional\" \"address\" \"address\" \"address\" \"address\" \"add\" \"adjust\" \"adjust\" \"adjust\" \"admin\" \"administrate\" \"administrate\" \"administrate\" \"administrator\" \"admire\" \"admission\" \"admit\" \"admit\" \"admitted\" \"admitting\" \"ado\" \"adopt\" \"adopt\" \"adopt\" \"ad\" \"adult\" \"adult\" \"advance\" \"advance\" \"advantage\" \"advantage\" \"adventure\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advertise\" \"advice\" \"advise\" \"advise\" \"advise\" \"advisor\" \"advisory\" \"advocacy\" \"advocate\" \"advocate\" \"affair\" \"affair\" \"affect\" \"affect\" \"affiliate\" \"affiliate\" \"affiliate\" \"affiliate\" \"afford\" \"afghan\" \"afghanistan\" \"afraid\" \"africa\" \"african\" \"aft\" \"aftermath\" \"afternoon\" \"afterward\" \"age\" \"age\" \"agency\" \"agency\" \"agenda\" \"agent\" \"agent\" \"age\" \"aggressive\" \"aggressively\" \"agree\" \"agree\" \"agree\" \"agree\" \"agree\" \"agriculture\" \"ahead\" \"aid\" \"aide\" \"aid\" \"aide\" \"aim\" \"aim\" \"aim\" \"air\" \"airborne\" \"aircraft\" \"air\" \"air\" \"airplane\" \"airport\" \"airwaves\" \"akin\" \"alabama\" \"alan\" \"alarm\" \"alaska\" \"albuquerque\" \"alert\" \"alert\" \"alexander\" \"alexander\" \"alice\" \"alienate\" \"ale\" \"allegation\" \"allegation\" \"allege\" \"allege\" \"allegiance\" \"allegory\" \"allen\" \"alliance\" \"alliance\" \"al\" \"al\" \"allow\" \"allow\" \"al\" \"alongside\" \"alternate\" \"alternate\" \"altogether\" \"amaze\" \"amaze\" \"amazon\" \"ambassador\" \"ambition\" \"ambitious\" \"ambush\" \"amend\" \"amend\" \"america\" \"american\" \"american\" \"america\" \"amid\" \"amidst\" \"ammo\" \"ammunition\" \"amount\" \"amount\" \"amp\" \"amphibian\" \"ample\" \"analogy\" \"analyses\" \"analysis\" \"analyst\" \"analyst\" \"analyze\" \"analyze\" \"anchor\" \"ancient\" \"andrew\" \"anecdotal\" \"anemic\" \"anew\" \"anger\" \"anger\" \"angry\" \"angst\" \"ann\" \"anniversary\" \"announce\" \"announce\" \"announce\" \"announce\" \"announce\" \"annoy\" \"annual\" \"anonymity\" \"anonymous\" \"answer\" \"answer\" \"answer\" \"answer\" \"anthony\" \"antiabortion\" \"anticipate\" \"antiwar\" \"anxiety\" \"anymore\" \"anytime\" \"apology\" \"apologist\" \"apologize\" \"apology\" \"appall\" \"apparatus\" \"apparent\" \"apparently\" \"appeal\" \"appeal\" \"appeal\" \"appeal\" \"appearance\" \"appearance\" \"appear\" \"appear\" \"appear\" \"applause\" \"apple\" \"apple\" \"apply\" \"apply\" \"apply\" \"apply\" \"apply\" \"appoint\" \"appoint\" \"appreciate\" \"appreciate\" \"approach\" \"approach\" \"approach\" \"approach\" \"appropriate\" \"approval\" \"approve\" \"approve\" \"approximate\" \"april\" \"apt\" \"arab\" \"arabia\" \"arabic\" \"arab\" \"architect\" \"arch\" \"arctic\" \"area\" \"area\" \"arena\" \"argue\" \"argue\" \"argue\" \"argue\" \"argument\" \"argument\" \"arizona\" \"arkansas\" \"arlington\" \"arm\" \"arm\" \"armor\" \"armor\" \"arm\" \"army\" \"arnold\" \"arrogance\" \"arrogant\" \"art\" \"article\" \"article\" \"articulate\" \"artillery\" \"asap\" \"asia\" \"asian\" \"ask\" \"ask\" \"aspect\" \"aspect\" \"aspirate\" \"ass\" \"assassinate\" \"assault\" \"assemble\" \"assembly\" \"assert\" \"assertion\" \"assertion\" \"ass\" \"assess\" \"assess\" \"assess\" \"asset\" \"asset\" \"asshole\" \"asshole\" \"assign\" \"assign\" \"assist\" \"assistance\" \"assistant\" \"associate\" \"associate\" \"associate\" \"assume\" \"assume\" \"assume\" \"assume\" \"assumption\" \"assumption\" \"assure\" \"assure\" \"atlanta\" \"atlantic\" \"atomic\" \"atrocity\" \"attach\" \"attack\" \"attack\" \"attack\" \"attack\" \"attempt\" \"attempt\" \"attempt\" \"attempt\" \"attend\" \"attendance\" \"attend\" \"attend\" \"attention\" \"attitude\" \"attitude\" \"attorney\" \"attorney\" \"attract\" \"attract\" \"attribute\" \"audience\" \"audio\" \"august\" \"austin\" \"australia\" \"australian\" \"author\" \"authority\" \"authority\" \"authorization\" \"authorize\" \"authorize\" \"author\" \"automate\" \"auxiliary\" \"average\" \"avoid\" \"avoid\" \"avoid\" \"await\" \"await\" \"award\" \"award\" \"award\" \"aware\" \"aware\" \"awesome\" \"awful\" \"awol\" \"ayatollah\" \"baby\" \"back\" \"back\" \"background\" \"back\" \"back\" \"bad\")]"}
+;; <=
+
+;; **
+;;; - Upon plurals
+;; **
+
+;; @@
+(def plurals (filter #(re-matches #".*s$" %) keywords))
+;(count plurals)
+(def plurals (take 100 plurals))
+;; @@
+;; =>
+;;; {"type":"html","content":"<span class='clj-var'>#&#x27;stemmers-compared.core/plurals</span>","value":"#'stemmers-compared.core/plurals"}
+;; <=
+
+;; @@
+;K stem
+(def kstem-keywords-res (get-stem kstem plurals))
+(def hits (get-hits kstem-keywords-res))
+hits
+;matched likely plurals
+(filter #(re-matches #".*s$" %) (second hits))
+
+;EnglishMinimal
+(def en-min-stem-res (map #(luke-stem (EnglishMinimalStemmer.) % (count %)) plurals))
+(def hits (get-hits en-min-stem-res))
+hits
+(filter #(re-matches #".*s$" %) (second hits))
+
+;Hunspell
+(def hunspell-stem-res (filter #(not (= % nil)) (get-stem hunspell-stem plurals)))
+(def hits (get-hits hunspell-stem-res))
+hits
+(filter #(re-matches #".*s$" %) (second hits))
+;; @@
+;; ->
+;;; 
+;;; miss:  (abrams aps ashcroft atrio)
+;;; 
+;;; miss:  (abram activiti addresse agenci ala alli analysi angele apologi appli approache ap arkansa ashcroft asse atrio atrociti)
+;;; 
+;;; miss:  (abcs abram ala alzheimers angele aps armys arr arr ashcrofts atrios)
+;;; 
+;; <-
+;; =>
+;;; {"type":"list-like","open":"<span class='clj-lazy-seq'>(</span>","close":"<span class='clj-lazy-seq'>)</span>","separator":" ","items":[{"type":"html","content":"<span class='clj-string'>&quot;access&quot;</span>","value":"\"access\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;address&quot;</span>","value":"\"address\""},{"type":"html","content":"<span class='clj-string'>&quot;airwaves&quot;</span>","value":"\"airwaves\""},{"type":"html","content":"<span class='clj-string'>&quot;ambitious&quot;</span>","value":"\"ambitious\""},{"type":"html","content":"<span class='clj-string'>&quot;analyses&quot;</span>","value":"\"analyses\""},{"type":"html","content":"<span class='clj-string'>&quot;analysis&quot;</span>","value":"\"analysis\""},{"type":"html","content":"<span class='clj-string'>&quot;anonymous&quot;</span>","value":"\"anonymous\""},{"type":"html","content":"<span class='clj-string'>&quot;apparatus&quot;</span>","value":"\"apparatus\""},{"type":"html","content":"<span class='clj-string'>&quot;arkansas&quot;</span>","value":"\"arkansas\""},{"type":"html","content":"<span class='clj-string'>&quot;ass&quot;</span>","value":"\"ass\""},{"type":"html","content":"<span class='clj-string'>&quot;ass&quot;</span>","value":"\"ass\""},{"type":"html","content":"<span class='clj-string'>&quot;assess&quot;</span>","value":"\"assess\""},{"type":"html","content":"<span class='clj-string'>&quot;assess&quot;</span>","value":"\"assess\""}],"value":"(\"access\" \"address\" \"address\" \"airwaves\" \"ambitious\" \"analyses\" \"analysis\" \"anonymous\" \"apparatus\" \"arkansas\" \"ass\" \"ass\" \"assess\" \"assess\")"}
+;; <=
+
+;; **
+;;; #Making a choice
+;;; 
+;;; Regular english stemmers:
+;;; Lancaster & Lovins stemmer are the most aggresive and they stem 'libraries' to 'libr'.
+;;; Porter 1 & 2 stems are less aggresive and they stem 'libraries' to 'librari' but 'apples' to 'appl'.
+;;; 
+;;; Since the search results are presented for the consumption of a human user, lighter stemmer to stem less aggressively still and not match a wide set of documents is preferred.
+;;; 
+;;; EnglishMinimalStemmer stems 'apples' to 'apple'.
+;;; 
+;;; HunspellStemmer & K stemmer stems 'libraries' to 'library' as well. 
+;;; 
+;;; By looking through the list of stems that end in 's', it is clear that K stemmer leaves behind the most number of plurals among the three.
+;;; 
+;;; HunspellStemmer promises a better hit rate than EnglishMinimalStemmer. Also, with HunspellStemmer, we can be sure that the word is stemmed into a meaningful word or not stemmed at all.
+;;; 
+;;; From the misses stems have had at the dictionary, we know that key phrases specific to dataset (new words) are also handled by HunspellStemmer better than EnglighMinimalStemmer.
+;;; 
+;;; Parallely, you may also choose to stem words that are not stemmed by HunspellStemmer with KStemmer.
+;;; 
+;;; The stemming requires re-tuning via customising the Hunspell dictionary to apply desired rules on words from a dataset. If it is frequently ungrammatical, we may need unconventional approaches.
+;;; 
+;;; HunspellStemmer creates a dictionary of inflected forms of words using 2 files. One, a dictionary file that contains words & rules that applies to each. Second, an affixes file that defines the action (adding or removing suffix or prefix) for each rule.
+;;; 
+;;; 
+;;; #Controlling stemming degree
+;;; 
+;;; The token filters - 'keyword_marker' and 'stemmer_override' to skip stemming for the defined keywords and to redefine stemming rule for words respectively allow us to customize the stemming process.
+;; **
+
+;; **
+;;; 
+;; **
